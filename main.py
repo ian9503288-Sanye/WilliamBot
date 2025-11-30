@@ -4,25 +4,23 @@ import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
 import yt_dlp
 import asyncio
-import os # 務必確認有這一行
+import os
 import sys
-from keep_alive import keep_alive
+import aiohttp
+import io
+from keep_alive import keep_alive # 引入心跳機
 
 # ==========================================
-#  雲端版設定：改用 os.getenv 讀取密碼
+#  雲端版設定：從 Render 環境變數讀取
 # ==========================================
-# 這樣做，我們就不會把密碼直接暴露在程式碼裡
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
-# 讀取 ID，如果讀不到預設為 0 (避免報錯)
 try:
     MASTER_ID = int(os.getenv("MASTER_ID"))
 except:
     MASTER_ID = 0
 # ==========================================
-
-# ... (下面的程式碼完全不用動) ...
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -42,11 +40,13 @@ system_instruction = """
 4. 刪除本頻道 -> CMD:DELETE_THIS
 5. 清除訊息 -> CMD:CLEAN|數量
 6. 踢出成員 -> CMD:KICK|成員名
-7. 關機/休息 -> CMD:SHUTDOWN
+7. 關機 -> CMD:SHUTDOWN
+8. 繪圖 -> CMD:IMAGE|畫面描述英文Prompt
+9. 提醒/計時 -> CMD:REMIND|秒數|提醒內容
 
 範例：
-使用者：「威廉，你可以去休息了。」
-你回：「遵命，少爺。祝您有個美好的夜晚，威廉先行告退。\nCMD:SHUTDOWN」
+使用者：「畫一隻貓。」
+你回：「遵命，少爺。\nCMD:IMAGE|A cute cat, high quality」
 """
 
 model = genai.GenerativeModel('gemini-flash-latest', system_instruction=system_instruction)
@@ -59,54 +59,28 @@ safety_settings = {
 }
 
 chat_sessions = {}
-# --- 把舊的那行刪掉，貼上這一大段 ---
-yt_dlp_opts = {
-    'format': 'bestaudio/best',
-    'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
-    'restrictfilenames': True,
-    'noplaylist': True,
-    'nocheckcertificate': True,
-    'ignoreerrors': False,
-    'logtostderr': False,
-    'quiet': True,
-    'no_warnings': True,
-    'default_search': 'auto',
-    'source_address': '0.0.0.0', 
-    'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-}
+# 音樂設定 (雖然雲端跑不動，但程式碼留著以免報錯)
+yt_dlp_opts = {'format': 'bestaudio/best', 'noplaylist': True, 'quiet': True}
 ffmpeg_opts = {'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5', 'options': '-vn'}
+
+async def start_reminder(channel, seconds, content):
+    await asyncio.sleep(seconds)
+    await channel.send(f"⏰ **威廉提醒**：{content}")
 
 @bot.event
 async def on_ready():
-    print(f'威廉管家 (含關機功能) 已上線')
+    print(f'威廉管家 (雲端繪圖版) 已上線')
 
 @bot.event
 async def on_message(message):
     if message.author == bot.user: return
     if message.content.startswith('!'): await bot.process_commands(message); return
 
-    # ==========================================
-    # ★★★ 只認 Tag (無視空格版) ★★★
-    # ==========================================
-    # 只要訊息裡有藍色的 @威廉管家，就會觸發
     if bot.user.mentioned_in(message):
-        
-        # 1. 判斷身分
         user_identity = "少爺 (Master)" if message.author.id == MASTER_ID else "貴賓 (VIP)"
-        
-        # 2. 【關鍵處理】把 Tag 變成的亂碼拿掉
-        # Discord 的 Tag 其實是一串像 <@123456789> 的字串
-        # 我們把它刪掉，剩下的就是你打的內容
         clean_content = message.content.replace(f'<@{bot.user.id}>', '').strip()
-        
-        # 如果因為黏太緊，導致還有殘留的符號 (針對手機版或特殊狀況的防呆)
-        if clean_content.startswith('>'): 
-             clean_content = clean_content[1:].strip()
-
-        # 如果只 Tag 沒講話
         if not clean_content: clean_content = "你好"
 
-        # 3. 讀取歷史
         history_log = []
         async for msg in message.channel.history(limit=10, before=message):
             if msg.author == bot.user: continue
@@ -114,7 +88,6 @@ async def on_message(message):
             history_log.append(f"[{role}]: {msg.content}")
         history_text = "\n".join(history_log[::-1])
 
-        # 4. 組合提示詞
         final_prompt = f"""
         [歷史紀錄]
         {history_text}
@@ -141,28 +114,30 @@ async def on_message(message):
 
                     if chat_content: await message.channel.send(chat_content)
 
-                    if "|" in command_content: action, value = command_content.split("|", 1)
-                    else: action, value = command_content, None
+                    if "|" in command_content: 
+                        cmd_parts = command_content.split("|")
+                        action = cmd_parts[0]
+                        value = cmd_parts[1]
+                        extra_value = cmd_parts[2] if len(cmd_parts) > 2 else None
+                    else:
+                        action, value, extra_value = command_content, None, None
 
-                    # --- 執行動作 ---
                     if action == "PLAY":
-                        if not message.author.voice:
-                            await message.channel.send("威廉：請先加入語音頻道。")
-                        else:
-                            vc = message.guild.voice_client
-                            if not vc: 
-                                await message.author.voice.channel.connect()
-                                vc = message.guild.voice_client
-                            vc.stop()
-                            if not chat_content: await message.channel.send(f"搜尋中：{value}")
-                            try:
-                                with yt_dlp.YoutubeDL(yt_dlp_opts) as ydl:
-                                    info = ydl.extract_info(f"ytsearch:{value}", download=False)['entries'][0]
-                                    source = discord.FFmpegPCMAudio(info['url'], executable='ffmpeg.exe', **ffmpeg_opts)
-                                    vc.play(source)
-                                    await message.channel.send(f"🎵 播放：**{info['title']}**")
-                            except Exception as e: await message.channel.send(f"播放失敗：{e}")
-
+                         await message.channel.send("威廉：抱歉，雲端模式無法支援音樂播放，請少爺改用本機模式。")
+                    elif action == "IMAGE":
+                        prompt = value.replace(" ", "%20")
+                        image_url = f"https://image.pollinations.ai/prompt/{prompt}"
+                        async with aiohttp.ClientSession() as session:
+                            async with session.get(image_url) as resp:
+                                if resp.status == 200:
+                                    data = io.BytesIO(await resp.read())
+                                    await message.channel.send(file=discord.File(data, 'generated.png'))
+                                else:
+                                    await message.channel.send("威廉：作畫失敗。")
+                    elif action == "REMIND":
+                        try:
+                            bot.loop.create_task(start_reminder(message.channel, int(value), extra_value if extra_value else "時間到"))
+                        except: await message.channel.send("時間格式錯誤")
                     elif action == "NEW_TEXT": await message.guild.create_text_channel(value); await message.channel.send(f"已建立：{value}")
                     elif action == "NEW_VOICE": await message.guild.create_voice_channel(value); await message.channel.send(f"已建立：{value}")
                     elif action == "DELETE_THIS": await message.channel.send("銷毀中..."); await asyncio.sleep(3); await message.channel.delete()
@@ -174,11 +149,8 @@ async def on_message(message):
                         if mem: await mem.kick(); await message.channel.send(f"已踢出 {mem.name}")
                         else: await message.channel.send("找不到成員")
                     elif action == "SHUTDOWN":
-                        if message.author.id == MASTER_ID:
-                            await bot.close()
-                            sys.exit()
-                        else:
-                            await message.channel.send("威廉：權限不足。")
+                         # 雲端版不建議用 shutdown，因為會導致 Render 報錯重啟，所以我們只回話
+                         await message.channel.send("威廉：雲端模式下，我必須保持清醒為您服務。")
                     else:
                         await message.channel.send(f"(未知指令：{action})")
                 else:
@@ -187,14 +159,11 @@ async def on_message(message):
             except Exception as e:
                 print(f"Error: {e}")
 
-# 傳統指令區
 @bot.command()
-async def join(ctx):
-    if ctx.author.voice: await ctx.author.voice.channel.connect()
+async def join(ctx): pass # 雲端版停用
 @bot.command()
-async def leave(ctx):
-    if ctx.voice_client: await ctx.voice_client.disconnect()
+async def leave(ctx): pass # 雲端版停用
 
 if __name__ == "__main__":
-    keep_alive()
+    keep_alive() # 啟動心跳機
     bot.run(DISCORD_TOKEN)
