@@ -1,0 +1,5 @@
+discord.py
+google-generativeai
+yt-dlp
+PyNaCl
+Flask
